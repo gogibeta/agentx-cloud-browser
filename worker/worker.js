@@ -20,14 +20,14 @@
  */
 
 const BACKEND_KEY = "current";
-// Tunnel providers: the runner currently uses bore (bore.pub) — no signup,
-// no account, prints its public URL reliably to stdout.
+// Tunnel providers: the runner currently uses tunnelmole — no signup, no
+// account, prints its public https:// URL reliably to stdout.
 // Dropped: cloudflared quick tunnels (their edge 403-blocks datacenter IPs,
 // including Cloudflare Workers themselves); localhost.run (never prints the
 // assigned tunnel URL without an interactive terminal); pinggy (free tier now
-// needs a token / has a 60-min cap); ngrok (now demands a payment method at
-// signup).
-const TUNNEL_RE = /^https?:\/\/(bore\.pub:\d+|[a-z0-9.-]+\.(trycloudflare\.com|localhost\.run|ngrok-free\.app|ngrok\.io))\/?$/;
+// needs a token / has a 60-min cap); ngrok (signup now demands a payment
+// method); bore (bore.pub printed a URL but never forwarded any data).
+const TUNNEL_RE = /^https:\/\/[a-z0-9.-]+\.(trycloudflare\.com|localhost\.run|ngrok-free\.app|ngrok\.io|tunnelmole\.net)\/?$/;
 
 // Free-tier KV guard: the tunnel URL is cached in the Worker's memory and
 // KV is read at most ONCE PER 60 SECONDS per Worker isolate, instead of on
