@@ -56,6 +56,9 @@ jobs:
 
       - name: Start public tunnel and register with Worker
         # SSH reverse tunnel to localhost.run (no account, no key needed).
+        # The tunnel URL is SELF-VERIFIED: we try every localhost.run URL in
+        # the ssh log and keep the one that actually serves our Chromium
+        # (the ssh banner also prints unrelated localhost.run links).
         run: |
           ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes \
@@ -64,18 +67,24 @@ jobs:
           echo $! > /tmp/tunnel.pid
           TUNNEL_URL=""
           for i in $(seq 1 60); do
-            TUNNEL_URL=$(grep -Eo 'https?://[A-Za-z0-9.-]+\.localhost\.run' /tmp/tunnel.log | head -1)
-            [ -n "$TUNNEL_URL" ] && break
+            CANDS=$(grep -Eo 'https?://[A-Za-z0-9.-]+\.localhost\.run' /tmp/tunnel.log | sort -u)
+            if [ -n "$CANDS" ]; then
+              for c in $CANDS; do
+                c=$(echo "$c" | sed 's|^http://|https://|')
+                echo "::add-mask::$c"
+                if curl -sf -m 10 "$c/json/version" 2>/dev/null | grep -q '"Browser"'; then
+                  TUNNEL_URL="$c"; break 2
+                fi
+              done
+            fi
             sleep 5
           done
-          echo "--- tunnel log ---"; cat /tmp/tunnel.log; echo "--- end log ---"
           if [ -z "$TUNNEL_URL" ]; then
-            echo "Tunnel failed to start"; exit 1
+            echo "No working tunnel URL. Redacted ssh log:"
+            sed -E 's|https?://[A-Za-z0-9.-]+\.localhost\.run|https://***.localhost.run|g' /tmp/tunnel.log
+            exit 1
           fi
-          # normalize to https
-          TUNNEL_URL=$(echo "$TUNNEL_URL" | sed 's|^http://|https://|')
-          echo "::add-mask::$TUNNEL_URL"
-          echo "Tunnel is up (masked in logs)"
+          echo "Tunnel verified (URL masked in logs)"
           curl -sf -X POST "$WORKER_URL/register" \
             -H "Authorization: Bearer $RELAY_SECRET" \
             -H "Content-Type: application/json" \
@@ -89,9 +98,7 @@ jobs:
       - name: Chain successor run and hold until timeout
         run: |
           TUNNEL_URL=$(cat /tmp/tunnel_url)
-          # Dispatch the next run at ~4h50m so it is serving before this
-          # job is killed at ~5h55m (~1h overlap, zero downtime).
-          ( sleep 17400
+          dispatch_next() {
             if curl -sf -X POST \
               -H "Authorization: Bearer $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -100,11 +107,20 @@ jobs:
               echo "successor dispatched"
             else
               echo "successor dispatch FAILED"
-            fi ) &
+            fi
+          }
+          # Dispatch the next run at ~4h50m so it is serving before this
+          # job is killed at ~5h55m (~1h overlap, zero downtime).
+          # NOTE: dispatches always run the workflow file as it exists on the
+          # branch AT DISPATCH TIME, so successors self-heal to the newest code.
+          ( sleep 17400; dispatch_next ) &
           for i in $(seq 1 70); do
             sleep 300
-            curl -sf "$TUNNEL_URL/json/version" >/dev/null \
-              || { echo "Tunnel lost, exiting early"; exit 0; }
+            if ! curl -sf -m 20 "$TUNNEL_URL/json/version" >/dev/null; then
+              echo "Tunnel lost, dispatching successor now and exiting"
+              dispatch_next
+              exit 0
+            fi
           done
           echo "Hold complete, job will now exit before the 6h limit"
         env:
