@@ -1,21 +1,24 @@
 name: cloud-browser
 
 # AgentX cloud browser PoC (EXPERIMENTAL).
-# Runs headless Chromium on the GitHub-hosted runner, exposes it via an ngrok
-# tunnel (free tier), and registers the tunnel URL with the Cloudflare Worker
-# so clients always use ONE stable Worker URL.
+# Runs headless Chromium on the GitHub-hosted runner and bridges it to a
+# Cloudflare Durable Object (singleton "browser-main") over ONE outbound
+# WebSocket. Clients always use ONE stable Worker URL; the DO relays CDP
+# HTTP + WebSocket between clients and whichever runner is currently up.
 #
-# NOTE: several tunnels were tried and dropped — cloudflared quick tunnels
-# (their edge 403-blocks datacenter IPs, including Cloudflare Workers
-# themselves), localhost.run (never prints the assigned URL without an
-# interactive terminal), pinggy (free tier now needs a token), ngrok (signup
-# now demands a payment method), bore (bore.pub printed a URL but forwarded
-# no data). tunnelmole's client prints its public https:// URL to stdout,
-# which the runner parses reliably.
+# No third-party tunnel service is used at all. Dropped over time:
+# cloudflared quick tunnels (edge 403-blocks datacenter IPs, including
+# Cloudflare Workers themselves), localhost.run (never prints the assigned
+# URL without an interactive terminal), pinggy (free tier needs a token /
+# 60-min cap), ngrok (signup demands a payment method), bore (bore.pub
+# printed a URL but forwarded no data), tunnelmole (URL worked but the
+# tunnel returned empty HTTP 500s for tunneled traffic).
 #
 # Restarts are SELF-CHAINED: each run dispatches its own successor via the
-# GitHub API at ~4h50m, well before the 6h job kill. No reliance on GitHub's
-# scheduled cron. A separate watchdog re-dispatches if the chain ever breaks.
+# GitHub API at ~4h50m, well before the 6h job kill. The successor simply
+# opens a new uplink WebSocket; the DO swaps it in with zero client-visible
+# downtime. No reliance on GitHub's scheduled cron. A separate watchdog
+# re-dispatches if the chain ever breaks.
 
 on:
   workflow_dispatch:
@@ -41,11 +44,6 @@ jobs:
           git commit -m "heartbeat $(date -u +%FT%TZ)" >/dev/null 2>&1 || true
           git push >/dev/null 2>&1 || true
 
-      - name: Install tunnelmole (tunnel client)
-        run: |
-          npm install -g tunnelmole 2>&1 | tail -2 || sudo npm install -g tunnelmole 2>&1 | tail -2
-          tmole --help 2>&1 | head -5 || tmole 2>&1 | head -5
-
       - name: Start Chromium (headless, CDP on 127.0.0.1:9222)
         run: |
           CHROME=$(which google-chrome || which chromium-browser || which chromium)
@@ -62,96 +60,38 @@ jobs:
           done
           curl -sf http://127.0.0.1:9222/json/version | head -c 300; echo
 
-      - name: Start tunnelmole tunnel and register with Worker
-        # tunnelmole prints "https://xxx.tunnelmole.net" to stdout — reliable
-        # discovery. HTTPS, so the Worker's existing wss:// bridging works
-        # unchanged. The URL is self-verified against our Chromium before
-        # registering.
-        #
-        # NOTE: tunnelmole (Node.js) forwards to localhost:<port>, which it
-        # resolves to ::1 (IPv6) first, but Chromium is bound to 127.0.0.1
-        # (IPv4-only). So we run a tiny dual-stack forwarder on 9223 ->
-        # 127.0.0.1:9222 and point tunnelmole at 9223.
+      - name: Connect relay to Cloudflare Durable Object
+        # runner/relay.py bridges local CDP to the DO over one outbound WSS.
+        # No tunnel, no port forwarding, no third-party service. The relay
+        # auto-reconnects; the DO treats the newest uplink as current.
         run: |
-          cat > /tmp/fwd.py <<'PYEOF'
-          import socket, threading
-          srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-          srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-          try:
-              srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-          except Exception:
-              pass
-          srv.bind(("::", 9223)); srv.listen(50)
-          def pipe(a, b):
-              try:
-                  while True:
-                      d = a.recv(65536)
-                      if not d: break
-                      b.sendall(d)
-              except Exception:
-                  pass
-              finally:
-                  a.close(); b.close()
-          def handle(client):
-              try:
-                  backend = socket.create_connection(("127.0.0.1", 9222), timeout=10)
-              except Exception:
-                  client.close(); return
-              threading.Thread(target=pipe, args=(client, backend), daemon=True).start()
-              threading.Thread(target=pipe, args=(backend, client), daemon=True).start()
-          while True:
-              c, _ = srv.accept()
-              threading.Thread(target=handle, args=(c,), daemon=True).start()
-          PYEOF
-          python3 /tmp/fwd.py >/tmp/fwd.log 2>&1 &
-          # sanity: forwarder must serve Chromium locally (v4 and v6)
-          for i in $(seq 1 10); do
-            if curl -sf -m 5 http://127.0.0.1:9223/json/version 2>/dev/null | grep -q '"Browser"'; then
-              echo "forwarder OK"; break
-            fi
-            [ "$i" -eq 10 ] && { echo "forwarder failed"; cat /tmp/fwd.log; exit 1; }
-            sleep 2
-          done
-          tmole 9223 >/tmp/tmole.log 2>&1 &
-          TUNNEL_URL=""
-          for i in $(seq 1 60); do
-            TUNNEL_URL=$(grep -Eo 'https://[a-z0-9.-]+\.tunnelmole\.net' /tmp/tmole.log 2>/dev/null | head -1)
-            if [ -n "$TUNNEL_URL" ]; then
-              echo "::add-mask::$TUNNEL_URL"
-              echo "tunnelmole tunnel is up (URL masked in logs)"
+          pip install --quiet websockets
+          python3 runner/relay.py >/tmp/relay.log 2>&1 &
+          for i in $(seq 1 30); do
+            if grep -q "connected to DO" /tmp/relay.log 2>/dev/null; then
+              echo "relay uplink established"
               break
             fi
-            if ! pgrep -f "tmole 9223" >/dev/null; then
-              echo "tmole process died. Log:"; cat /tmp/tmole.log; exit 1
+            if ! pgrep -f "runner/relay.py" >/dev/null; then
+              echo "relay died. Log:"; cat /tmp/relay.log; exit 1
             fi
+            sleep 4
+          done
+          grep -q "connected to DO" /tmp/relay.log || { echo "relay never connected"; cat /tmp/relay.log; exit 1; }
+          # The DO should now report a live browser on the public /health.
+          for i in $(seq 1 12); do
+            if curl -sf -m 10 "$WORKER_URL/health" | grep -q '"ok":true'; then
+              echo "Worker reports browser online"; break
+            fi
+            [ "$i" -eq 12 ] && { echo "Worker health never went ok"; exit 1; }
             sleep 5
           done
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "tmole gave no URL. Log:"; cat /tmp/tmole.log; exit 1
-          fi
-          for i in $(seq 1 24); do
-            RESP=$(curl -s -m 15 -w '\nHTTP:%{http_code}' "$TUNNEL_URL/json/version" 2>/dev/null)
-            if echo "$RESP" | grep -q '"Browser"'; then
-              echo "tunnel verified serving Chromium"; break
-            fi
-            if [ "$i" -eq 24 ]; then
-              echo "tunnel URL does not serve CDP. Last response:"; echo "$RESP" | head -c 500; echo; exit 1
-            fi
-            sleep 5
-          done
-          curl -sf -X POST "$WORKER_URL/register" \
-            -H "Authorization: Bearer $RELAY_SECRET" \
-            -H "Content-Type: application/json" \
-            -d "{\"url\":\"$TUNNEL_URL\"}"
-          echo "Registered with Worker"
-          echo "$TUNNEL_URL" > /tmp/tunnel_url
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
 
       - name: Chain successor run and hold until timeout
         run: |
-          TUNNEL_URL=$(cat /tmp/tunnel_url)
           dispatch_next() {
             if curl -sf -X POST \
               -H "Authorization: Bearer $GITHUB_TOKEN" \
@@ -164,14 +104,18 @@ jobs:
             fi
           }
           # Dispatch the next run at ~4h50m so it is serving before this
-          # job is killed at ~5h55m (~1h overlap, zero downtime).
+          # job is killed at ~5h55m (~1h overlap, zero downtime — the DO
+          # swaps the uplink, clients see nothing).
           # NOTE: dispatches always run the workflow file as it exists on the
           # branch AT DISPATCH TIME, so successors self-heal to the newest code.
           ( sleep 17400; dispatch_next ) &
           for i in $(seq 1 70); do
             sleep 300
-            if ! curl -sf -m 20 "$TUNNEL_URL/json/version" >/dev/null; then
-              echo "Tunnel lost, dispatching successor now and exiting"
+            # If the relay died AND Chromium is gone, the chain is broken:
+            # dispatch a successor immediately instead of waiting.
+            if ! pgrep -f "runner/relay.py" >/dev/null && \
+               ! curl -sf -m 10 http://127.0.0.1:9222/json/version >/dev/null; then
+              echo "Relay and Chromium both down, dispatching successor now"
               dispatch_next
               exit 0
             fi
