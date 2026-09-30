@@ -67,8 +67,52 @@ jobs:
         # discovery. HTTPS, so the Worker's existing wss:// bridging works
         # unchanged. The URL is self-verified against our Chromium before
         # registering.
+        #
+        # NOTE: tunnelmole (Node.js) forwards to localhost:<port>, which it
+        # resolves to ::1 (IPv6) first, but Chromium is bound to 127.0.0.1
+        # (IPv4-only). So we run a tiny dual-stack forwarder on 9223 ->
+        # 127.0.0.1:9222 and point tunnelmole at 9223.
         run: |
-          tmole 9222 >/tmp/tmole.log 2>&1 &
+          cat > /tmp/fwd.py <<'PYEOF'
+          import socket, threading
+          srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+          srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          try:
+              srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+          except Exception:
+              pass
+          srv.bind(("::", 9223)); srv.listen(50)
+          def pipe(a, b):
+              try:
+                  while True:
+                      d = a.recv(65536)
+                      if not d: break
+                      b.sendall(d)
+              except Exception:
+                  pass
+              finally:
+                  a.close(); b.close()
+          def handle(client):
+              try:
+                  backend = socket.create_connection(("127.0.0.1", 9222), timeout=10)
+              except Exception:
+                  client.close(); return
+              threading.Thread(target=pipe, args=(client, backend), daemon=True).start()
+              threading.Thread(target=pipe, args=(backend, client), daemon=True).start()
+          while True:
+              c, _ = srv.accept()
+              threading.Thread(target=handle, args=(c,), daemon=True).start()
+          PYEOF
+          python3 /tmp/fwd.py >/tmp/fwd.log 2>&1 &
+          # sanity: forwarder must serve Chromium locally (v4 and v6)
+          for i in $(seq 1 10); do
+            if curl -sf -m 5 http://127.0.0.1:9223/json/version 2>/dev/null | grep -q '"Browser"'; then
+              echo "forwarder OK"; break
+            fi
+            [ "$i" -eq 10 ] && { echo "forwarder failed"; cat /tmp/fwd.log; exit 1; }
+            sleep 2
+          done
+          tmole 9223 >/tmp/tmole.log 2>&1 &
           TUNNEL_URL=""
           for i in $(seq 1 60); do
             TUNNEL_URL=$(grep -Eo 'https://[a-z0-9.-]+\.tunnelmole\.net' /tmp/tmole.log 2>/dev/null | head -1)
@@ -77,7 +121,7 @@ jobs:
               echo "tunnelmole tunnel is up (URL masked in logs)"
               break
             fi
-            if ! pgrep -f "tmole 9222" >/dev/null; then
+            if ! pgrep -f "tmole 9223" >/dev/null; then
               echo "tmole process died. Log:"; cat /tmp/tmole.log; exit 1
             fi
             sleep 5
@@ -85,11 +129,14 @@ jobs:
           if [ -z "$TUNNEL_URL" ]; then
             echo "tmole gave no URL. Log:"; cat /tmp/tmole.log; exit 1
           fi
-          for i in $(seq 1 12); do
-            if curl -sf -m 10 "$TUNNEL_URL/json/version" 2>/dev/null | grep -q '"Browser"'; then
+          for i in $(seq 1 24); do
+            RESP=$(curl -s -m 15 -w '\nHTTP:%{http_code}' "$TUNNEL_URL/json/version" 2>/dev/null)
+            if echo "$RESP" | grep -q '"Browser"'; then
               echo "tunnel verified serving Chromium"; break
             fi
-            if [ "$i" -eq 12 ]; then echo "tunnel URL does not serve CDP"; cat /tmp/tmole.log; exit 1; fi
+            if [ "$i" -eq 24 ]; then
+              echo "tunnel URL does not serve CDP. Last response:"; echo "$RESP" | head -c 500; echo; exit 1
+            fi
             sleep 5
           done
           curl -sf -X POST "$WORKER_URL/register" \
