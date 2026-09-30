@@ -5,12 +5,13 @@ name: cloud-browser
 # tunnel (free tier), and registers the tunnel URL with the Cloudflare Worker
 # so clients always use ONE stable Worker URL.
 #
-# NOTE: cloudflared quick tunnels were tried first but their edge 403-blocks
-# every datacenter IP — including Cloudflare Workers themselves — so the
-# Worker could never reach the tunnel. localhost.run was tried next but never
-# prints the assigned tunnel URL without an interactive terminal. ngrok was
-# dropped when signup started demanding a payment method. bore's client
-# prints its public URL to stdout, which the runner parses reliably.
+# NOTE: several tunnels were tried and dropped — cloudflared quick tunnels
+# (their edge 403-blocks datacenter IPs, including Cloudflare Workers
+# themselves), localhost.run (never prints the assigned URL without an
+# interactive terminal), pinggy (free tier now needs a token), ngrok (signup
+# now demands a payment method), bore (bore.pub printed a URL but forwarded
+# no data). tunnelmole's client prints its public https:// URL to stdout,
+# which the runner parses reliably.
 #
 # Restarts are SELF-CHAINED: each run dispatches its own successor via the
 # GitHub API at ~4h50m, well before the 6h job kill. No reliance on GitHub's
@@ -40,13 +41,10 @@ jobs:
           git commit -m "heartbeat $(date -u +%FT%TZ)" >/dev/null 2>&1 || true
           git push >/dev/null 2>&1 || true
 
-      - name: Install bore (tunnel client)
+      - name: Install tunnelmole (tunnel client)
         run: |
-          curl -fsSL -o /tmp/bore.tgz \
-            https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
-          tar -xzf /tmp/bore.tgz -C /tmp
-          chmod +x /tmp/bore
-          /tmp/bore --version
+          npm install -g tunnelmole 2>&1 | tail -2 || sudo npm install -g tunnelmole 2>&1 | tail -2
+          tmole --help 2>&1 | head -5 || tmole 2>&1 | head -5
 
       - name: Start Chromium (headless, CDP on 127.0.0.1:9222)
         run: |
@@ -64,34 +62,34 @@ jobs:
           done
           curl -sf http://127.0.0.1:9222/json/version | head -c 300; echo
 
-      - name: Start bore tunnel and register with Worker
-        # bore prints "listening at bore.pub:PORT" to stdout — reliable
-        # discovery, no log scraping of banners. The URL is self-verified
-        # against our Chromium before registering.
+      - name: Start tunnelmole tunnel and register with Worker
+        # tunnelmole prints "https://xxx.tunnelmole.net" to stdout — reliable
+        # discovery. HTTPS, so the Worker's existing wss:// bridging works
+        # unchanged. The URL is self-verified against our Chromium before
+        # registering.
         run: |
-          /tmp/bore local 9222 --to bore.pub >/tmp/bore.log 2>&1 &
+          tmole 9222 >/tmp/tmole.log 2>&1 &
           TUNNEL_URL=""
           for i in $(seq 1 60); do
-            PORT=$(grep -Eo 'bore\.pub:[0-9]+' /tmp/bore.log 2>/dev/null | head -1 | cut -d: -f2)
-            if [ -n "$PORT" ]; then
-              TUNNEL_URL="http://bore.pub:$PORT"
+            TUNNEL_URL=$(grep -Eo 'https://[a-z0-9.-]+\.tunnelmole\.net' /tmp/tmole.log 2>/dev/null | head -1)
+            if [ -n "$TUNNEL_URL" ]; then
               echo "::add-mask::$TUNNEL_URL"
-              echo "bore tunnel is up (URL masked in logs)"
+              echo "tunnelmole tunnel is up (URL masked in logs)"
               break
             fi
-            if ! pgrep -f "bore local 9222" >/dev/null; then
-              echo "bore process died. Log:"; cat /tmp/bore.log; exit 1
+            if ! pgrep -f "tmole 9222" >/dev/null; then
+              echo "tmole process died. Log:"; cat /tmp/tmole.log; exit 1
             fi
             sleep 5
           done
           if [ -z "$TUNNEL_URL" ]; then
-            echo "bore gave no URL. Log:"; cat /tmp/bore.log; exit 1
+            echo "tmole gave no URL. Log:"; cat /tmp/tmole.log; exit 1
           fi
           for i in $(seq 1 12); do
             if curl -sf -m 10 "$TUNNEL_URL/json/version" 2>/dev/null | grep -q '"Browser"'; then
               echo "tunnel verified serving Chromium"; break
             fi
-            if [ "$i" -eq 12 ]; then echo "tunnel URL does not serve CDP"; exit 1; fi
+            if [ "$i" -eq 12 ]; then echo "tunnel URL does not serve CDP"; cat /tmp/tmole.log; exit 1; fi
             sleep 5
           done
           curl -sf -X POST "$WORKER_URL/register" \
