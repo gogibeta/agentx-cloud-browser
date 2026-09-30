@@ -22,6 +22,25 @@
 const BACKEND_KEY = "current";
 const TUNNEL_RE = /^https:\/\/[a-z0-9-]+\.trycloudflare\.com\/?$/;
 
+// Free-tier KV guard: the tunnel URL is cached in the Worker's memory and
+// KV is read at most ONCE PER 60 SECONDS per Worker isolate, instead of on
+// every proxied request. Writes happen ~5x/day (once per runner restart).
+// Free KV limits: 100k reads/day, 1k writes/day, 1GB — we stay far below.
+let cachedBackend = null; // {url, updated_at, fetched_at}
+const BACKEND_CACHE_TTL_MS = 60_000;
+
+async function getBackend(env) {
+  const now = Date.now();
+  if (cachedBackend && now - cachedBackend.fetched_at < BACKEND_CACHE_TTL_MS) {
+    return cachedBackend;
+  }
+  const raw = await env.BACKEND.get(BACKEND_KEY);
+  if (!raw) { cachedBackend = null; return null; }
+  const b = JSON.parse(raw);
+  cachedBackend = { url: b.url, updated_at: b.updated_at, fetched_at: now };
+  return cachedBackend;
+}
+
 function clientToken(request) {
   const url = new URL(request.url);
   const q = url.searchParams.get("token");
@@ -97,15 +116,16 @@ export default {
       catch { return new Response("bad json", { status: 400 }); }
       const backend = String(body.url || "").replace(/\/$/, "");
       if (!TUNNEL_RE.test(backend)) return new Response("bad url", { status: 400 });
-      await env.BACKEND.put(BACKEND_KEY, JSON.stringify({ url: backend, updated_at: Date.now() }));
+      const record = { url: backend, updated_at: Date.now() };
+      await env.BACKEND.put(BACKEND_KEY, JSON.stringify(record));
+      cachedBackend = { ...record, fetched_at: Date.now() }; // serve fresh immediately
       return json({ ok: true });
     }
 
     // ---- public health (no URL leak) ----
     if (path === "/health") {
-      const raw = await env.BACKEND.get(BACKEND_KEY);
-      if (!raw) return json({ ok: false, reason: "no backend registered" }, 503);
-      const b = JSON.parse(raw);
+      const b = await getBackend(env);
+      if (!b) return json({ ok: false, reason: "no backend registered" }, 503);
       return json({ ok: true, backend_age_s: Math.floor((Date.now() - b.updated_at) / 1000) });
     }
 
@@ -115,9 +135,9 @@ export default {
       return new Response("unauthorized", { status: 401 });
     }
 
-    const raw = await env.BACKEND.get(BACKEND_KEY);
-    if (!raw) return new Response("no backend registered", { status: 502 });
-    const backend = JSON.parse(raw).url;
+    const b = await getBackend(env);
+    if (!b) return new Response("no backend registered", { status: 502 });
+    const backend = b.url;
 
     const fwd = new URL(backend + path);
     // forward query string minus our token param
