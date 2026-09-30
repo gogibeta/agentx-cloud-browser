@@ -59,14 +59,20 @@ jobs:
         # The tunnel URL is SELF-VERIFIED: we try every localhost.run URL in
         # the ssh log and keep the one that actually serves our Chromium
         # (the ssh banner also prints unrelated localhost.run links).
+        # NOTE: -tt (pty) is required — the server only prints the assigned
+        # tunnel URL when the session has a terminal; with -T it stays silent.
         run: |
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes \
-              -o ConnectTimeout=15 -N -T \
+              -o ConnectTimeout=15 \
               -R 80:127.0.0.1:9222 nokey@localhost.run >/tmp/tunnel.log 2>&1 &
-          echo $! > /tmp/tunnel.pid
+          TUNPID=$!
+          echo $TUNPID > /tmp/tunnel.pid
           TUNNEL_URL=""
           for i in $(seq 1 60); do
+            if ! kill -0 $TUNPID 2>/dev/null; then
+              echo "ssh process died. Log:"; cat /tmp/tunnel.log; exit 1
+            fi
             CANDS=$(grep -Eo 'https?://[A-Za-z0-9.-]+\.localhost\.run' /tmp/tunnel.log | sort -u)
             if [ -n "$CANDS" ]; then
               for c in $CANDS; do
