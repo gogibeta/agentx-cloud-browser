@@ -1,14 +1,16 @@
 name: cloud-browser
 
 # AgentX cloud browser PoC (EXPERIMENTAL).
-# Runs headless Chromium on the GitHub-hosted runner, exposes it via an SSH
-# reverse tunnel (localhost.run, no account needed), and registers the tunnel
-# URL with the Cloudflare Worker so clients always use ONE stable Worker URL.
+# Runs headless Chromium on the GitHub-hosted runner, exposes it via an ngrok
+# tunnel (free tier), and registers the tunnel URL with the Cloudflare Worker
+# so clients always use ONE stable Worker URL.
 #
 # NOTE: cloudflared quick tunnels were tried first but their edge 403-blocks
 # every datacenter IP — including Cloudflare Workers themselves — so the
-# Worker could never reach the tunnel. localhost.run is not behind
-# Cloudflare, so Worker -> tunnel works.
+# Worker could never reach the tunnel. localhost.run was tried next but never
+# prints the assigned tunnel URL without an interactive terminal, so the
+# runner could not discover it. ngrok's local API reports the public URL as
+# JSON, which is reliable.
 #
 # Restarts are SELF-CHAINED: each run dispatches its own successor via the
 # GitHub API at ~4h50m, well before the 6h job kill. No reliance on GitHub's
@@ -38,6 +40,14 @@ jobs:
           git commit -m "heartbeat $(date -u +%FT%TZ)" >/dev/null 2>&1 || true
           git push >/dev/null 2>&1 || true
 
+      - name: Install ngrok
+        run: |
+          curl -fsSL -o /tmp/ngrok.tgz \
+            https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
+          tar -xzf /tmp/ngrok.tgz -C /tmp
+          chmod +x /tmp/ngrok
+          /tmp/ngrok version
+
       - name: Start Chromium (headless, CDP on 127.0.0.1:9222)
         run: |
           CHROME=$(which google-chrome || which chromium-browser || which chromium)
@@ -54,43 +64,39 @@ jobs:
           done
           curl -sf http://127.0.0.1:9222/json/version | head -c 300; echo
 
-      - name: Start public tunnel and register with Worker
-        # SSH reverse tunnel to localhost.run (no account, no key needed).
-        # The tunnel URL is SELF-VERIFIED: we try every localhost.run URL in
-        # the ssh log and keep the one that actually serves our Chromium
-        # (the ssh banner also prints unrelated localhost.run links).
-        # NOTE: -tt (pty) is required — the server only prints the assigned
-        # tunnel URL when the session has a terminal; with -T it stays silent.
+      - name: Start ngrok tunnel and register with Worker
+        # ngrok's local API (127.0.0.1:4040) reports the public URL as JSON —
+        # no log scraping needed. The URL is self-verified against our
+        # Chromium before registering.
         run: |
-          ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes \
-              -o ConnectTimeout=15 \
-              -R 80:127.0.0.1:9222 nokey@localhost.run >/tmp/tunnel.log 2>&1 &
-          TUNPID=$!
-          echo $TUNPID > /tmp/tunnel.pid
+          /tmp/ngrok config add-authtoken "$NGROK_AUTHTOKEN" >/dev/null 2>&1
+          /tmp/ngrok http 127.0.0.1:9222 --log=stdout >/tmp/ngrok.log 2>&1 &
           TUNNEL_URL=""
           for i in $(seq 1 60); do
-            if ! kill -0 $TUNPID 2>/dev/null; then
-              echo "ssh process died. Log:"; cat /tmp/tunnel.log; exit 1
-            fi
-            CANDS=$(grep -Eo 'https?://[A-Za-z0-9.-]+\.localhost\.run' /tmp/tunnel.log | sort -u)
-            if [ -n "$CANDS" ]; then
-              for c in $CANDS; do
-                c=$(echo "$c" | sed 's|^http://|https://|')
-                echo "::add-mask::$c"
-                if curl -sf -m 10 "$c/json/version" 2>/dev/null | grep -q '"Browser"'; then
-                  TUNNEL_URL="$c"; break 2
-                fi
-              done
-            fi
+            TUNNEL_URL=$(curl -sf -m 5 http://127.0.0.1:4040/api/tunnels 2>/dev/null | python3 -c "
+          import json,sys
+          try:
+              ts = json.load(sys.stdin).get('tunnels', [])
+              urls = [t['public_url'] for t in ts if t.get('proto') == 'https']
+              print(urls[0] if urls else '')
+          except Exception:
+              print('')
+          " 2>/dev/null)
+            [ -n "$TUNNEL_URL" ] && break
             sleep 5
           done
           if [ -z "$TUNNEL_URL" ]; then
-            echo "No working tunnel URL. Redacted ssh log:"
-            sed -E 's|https?://[A-Za-z0-9.-]+\.localhost\.run|https://***.localhost.run|g' /tmp/tunnel.log
-            exit 1
+            echo "ngrok failed to start:"; tail -30 /tmp/ngrok.log; exit 1
           fi
-          echo "Tunnel verified (URL masked in logs)"
+          echo "::add-mask::$TUNNEL_URL"
+          echo "ngrok tunnel is up (URL masked in logs)"
+          for i in $(seq 1 12); do
+            if curl -sf -m 10 "$TUNNEL_URL/json/version" 2>/dev/null | grep -q '"Browser"'; then
+              echo "tunnel verified serving Chromium"; break
+            fi
+            if [ "$i" -eq 12 ]; then echo "tunnel URL does not serve CDP"; exit 1; fi
+            sleep 5
+          done
           curl -sf -X POST "$WORKER_URL/register" \
             -H "Authorization: Bearer $RELAY_SECRET" \
             -H "Content-Type: application/json" \
@@ -100,6 +106,7 @@ jobs:
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
 
       - name: Chain successor run and hold until timeout
         run: |
