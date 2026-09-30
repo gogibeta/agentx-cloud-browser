@@ -1,0 +1,90 @@
+name: cloud-browser
+
+# AgentX cloud browser PoC (EXPERIMENTAL).
+# Runs headless Chromium on the GitHub-hosted runner, exposes it via a
+# cloudflared quick tunnel, and registers the tunnel URL with the
+# Cloudflare Worker so clients always use ONE stable Worker URL.
+#
+# Schedule: every 5h with up to ~55 min overlap between runs, so the
+# service never goes down even though each job is killed before 6h.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 */5 * * *'
+
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355 # hard kill stays under GitHub's 6h job limit
+    permissions:
+      contents: write # for the heartbeat commit below
+    # NOTE: no `concurrency` group on purpose — overlapping runs are required.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Heartbeat (keeps scheduled workflows enabled)
+        run: |
+          git config user.name "agentx-bot"
+          git config user.email "agentx-bot@users.noreply.github.com"
+          date -u +%FT%TZ > .heartbeat
+          git add .heartbeat
+          git commit -m "heartbeat $(date -u +%FT%TZ)" >/dev/null 2>&1 || true
+          git push >/dev/null 2>&1 || true
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cloudflared
+
+      - name: Start Chromium (headless, CDP on 127.0.0.1:9222)
+        run: |
+          CHROME=$(which google-chrome || which chromium-browser || which chromium)
+          echo "Using: $CHROME"
+          "$CHROME" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
+            --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 \
+            --user-data-dir=/tmp/chrome-profile about:blank >/tmp/chrome.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9222/json/version >/dev/null; then
+              echo "CDP is up"
+              break
+            fi
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:9222/json/version | head -c 300; echo
+
+      - name: Start quick tunnel and register with Worker
+        run: |
+          /tmp/cloudflared tunnel --url http://127.0.0.1:9222 >/tmp/tunnel.log 2>&1 &
+          TUNNEL_URL=""
+          for i in $(seq 1 60); do
+            TUNNEL_URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/tunnel.log | head -1)
+            [ -n "$TUNNEL_URL" ] && break
+            sleep 2
+          done
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "Tunnel failed to start:"; tail -20 /tmp/tunnel.log; exit 1
+          fi
+          echo "::add-mask::$TUNNEL_URL"
+          echo "Tunnel is up (masked in logs)"
+          curl -sf -X POST "$WORKER_URL/register" \
+            -H "Authorization: Bearer $RELAY_SECRET" \
+            -H "Content-Type: application/json" \
+            -d "{\"url\":\"$TUNNEL_URL\"}"
+          echo "Registered with Worker"
+          echo "$TUNNEL_URL" > /tmp/tunnel_url
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+
+      - name: Hold until timeout (overlap keeps the service continuous)
+        run: |
+          TUNNEL_URL=$(cat /tmp/tunnel_url)
+          for i in $(seq 1 70); do
+            sleep 300
+            curl -sf "$TUNNEL_URL/json/version" >/dev/null \
+              || { echo "Tunnel lost, exiting early"; exit 0; }
+          done
+          echo "Hold complete, job will now exit before the 6h limit"
