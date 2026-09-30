@@ -5,26 +5,26 @@ name: cloud-browser
 # cloudflared quick tunnel, and registers the tunnel URL with the
 # Cloudflare Worker so clients always use ONE stable Worker URL.
 #
-# Schedule: every 5h with up to ~55 min overlap between runs, so the
-# service never goes down even though each job is killed before 6h.
+# Restarts are SELF-CHAINED: each run dispatches its own successor via the
+# GitHub API at ~4h50m, well before the 6h job kill. No reliance on GitHub's
+# scheduled cron. A separate watchdog re-dispatches if the chain ever breaks.
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '17 */5 * * *'
 
 jobs:
   browser:
     runs-on: ubuntu-latest
     timeout-minutes: 355 # hard kill stays under GitHub's 6h job limit
     permissions:
-      contents: write # for the heartbeat commit below
+      contents: write # heartbeat commit
+      actions: write  # self-dispatch of the successor run
     # NOTE: no `concurrency` group on purpose — overlapping runs are required.
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Heartbeat (keeps scheduled workflows enabled)
+      - name: Heartbeat (keeps the repo active)
         run: |
           git config user.name "agentx-bot"
           git config user.email "agentx-bot@users.noreply.github.com"
@@ -79,12 +79,26 @@ jobs:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
 
-      - name: Hold until timeout (overlap keeps the service continuous)
+      - name: Chain successor run and hold until timeout
         run: |
           TUNNEL_URL=$(cat /tmp/tunnel_url)
+          # Dispatch the next run at ~4h50m so it is serving before this
+          # job is killed at ~5h55m (~1h overlap, zero downtime).
+          ( sleep 17400
+            if curl -sf -X POST \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/browser.yml/dispatches" \
+              -d '{"ref":"${{ github.ref_name }}"}'; then
+              echo "successor dispatched"
+            else
+              echo "successor dispatch FAILED"
+            fi ) &
           for i in $(seq 1 70); do
             sleep 300
             curl -sf "$TUNNEL_URL/json/version" >/dev/null \
               || { echo "Tunnel lost, exiting early"; exit 0; }
           done
           echo "Hold complete, job will now exit before the 6h limit"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
