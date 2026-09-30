@@ -20,10 +20,11 @@
  */
 
 const BACKEND_KEY = "current";
-// Tunnel providers: cloudflared quick tunnels are OUT (their edge 403s all
-// datacenter IPs, including Cloudflare Workers themselves), so the runner
-// uses an SSH reverse tunnel via localhost.run (no account needed).
-const TUNNEL_RE = /^https:\/\/[a-z0-9.-]+\.(trycloudflare\.com|localhost\.run)\/?$/;
+// Tunnel providers: the runner currently uses ngrok (reliable, free tier).
+// cloudflared quick tunnels were dropped (their edge 403-blocks datacenter
+// IPs, including Cloudflare Workers themselves); localhost.run was dropped
+// (never prints the assigned tunnel URL without an interactive terminal).
+const TUNNEL_RE = /^https:\/\/[a-z0-9.-]+\.(trycloudflare\.com|localhost\.run|ngrok-free\.app|ngrok\.io)\/?$/;
 
 // Free-tier KV guard: the tunnel URL is cached in the Worker's memory and
 // KV is read at most ONCE PER 60 SECONDS per Worker isolate, instead of on
