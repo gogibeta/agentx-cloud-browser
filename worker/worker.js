@@ -20,7 +20,10 @@
  */
 
 const BACKEND_KEY = "current";
-const TUNNEL_RE = /^https:\/\/[a-z0-9-]+\.trycloudflare\.com\/?$/;
+// Tunnel providers: cloudflared quick tunnels are OUT (their edge 403s all
+// datacenter IPs, including Cloudflare Workers themselves), so the runner
+// uses an SSH reverse tunnel via localhost.run (no account needed).
+const TUNNEL_RE = /^https:\/\/[a-z0-9.-]+\.(trycloudflare\.com|localhost\.run)\/?$/;
 
 // Free-tier KV guard: the tunnel URL is cached in the Worker's memory and
 // KV is read at most ONCE PER 60 SECONDS per Worker isolate, instead of on
@@ -34,7 +37,13 @@ async function getBackend(env) {
   if (cachedBackend && now - cachedBackend.fetched_at < BACKEND_CACHE_TTL_MS) {
     return cachedBackend;
   }
-  const raw = await env.BACKEND.get(BACKEND_KEY);
+  let raw = await env.BACKEND.get(BACKEND_KEY);
+  if (!raw) {
+    // KV is eventually consistent across PoPs; one quick retry so a fresh
+    // registration is not reported missing to the next request.
+    await new Promise(r => setTimeout(r, 2000));
+    raw = await env.BACKEND.get(BACKEND_KEY);
+  }
   if (!raw) { cachedBackend = null; return null; }
   const b = JSON.parse(raw);
   cachedBackend = { url: b.url, updated_at: b.updated_at, fetched_at: now };
