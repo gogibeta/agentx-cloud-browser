@@ -9,7 +9,7 @@ Phone/app ──wss/https──▶ Cloudflare Worker (stable URL, token auth)
                               │      KV read at most once/60s per isolate)
                               ▼
                      GitHub runner: Chromium --headless
-                              + bore tunnel (bore.pub, no account)
+                              + tunnelmole tunnel (no account)
 ```
 
 ## How it stays up (no GitHub cron)
