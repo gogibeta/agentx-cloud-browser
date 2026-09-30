@@ -9,7 +9,7 @@ Phone/app ──wss/https──▶ Cloudflare Worker (stable URL, token auth)
                               │      KV read at most once/60s per isolate)
                               ▼
                      GitHub runner: Chromium --headless
-                              + SSH reverse tunnel (localhost.run)
+                              + ngrok tunnel (free tier)
 ```
 
 ## How it stays up (no GitHub cron)
@@ -38,6 +38,7 @@ A watchdog also re-dispatches if the chain ever breaks.
 
 - `WORKER_URL` — the Worker's public URL (set after first deploy)
 - `RELAY_SECRET` — must match the Worker's `RELAY_SECRET` secret
+- `NGROK_AUTHTOKEN` — free ngrok account authtoken (ngrok.com dashboard)
 
 ## Test
 
