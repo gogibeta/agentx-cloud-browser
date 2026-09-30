@@ -9,7 +9,7 @@ Phone/app ──wss/https──▶ Cloudflare Worker (stable URL, token auth)
                               │      KV read at most once/60s per isolate)
                               ▼
                      GitHub runner: Chromium --headless
-                              + cloudflared quick tunnel
+                              + SSH reverse tunnel (localhost.run)
 ```
 
 ## How it stays up (no GitHub cron)
@@ -56,5 +56,7 @@ Full CDP (navigate, screenshot) goes over
   this on the account that builds/releases AgentX.
 - The workflow commits `.heartbeat` on every run to keep the repo active.
 - Quick-tunnel URLs are unguessable but not authenticated; the CLIENT_TOKEN
-  at the Worker is the real gate. For anything beyond a PoC, add a
+  at the Worker is the real gate. (cloudflared quick tunnels were dropped:
+  their edge 403-blocks datacenter IPs, including the Worker itself, so the
+  Worker could never reach them.) For anything beyond a PoC, add a
   token-checking sidecar on the runner in front of CDP.
